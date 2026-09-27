@@ -8,3 +8,4 @@ modules.order
 .*.cmd
 .tmp_versions/
 Module.symvers
+01-chardev/test_ioctl

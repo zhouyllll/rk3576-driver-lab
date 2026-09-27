@@ -42,12 +42,11 @@
 #define DEVICE_NAME "hello_chrdev"
 #define BUF_SIZE 256
 
+#include "hello_ioctl.h"  /* HELLO_MAGIC/HELLO_CLEAR/HELLO_GET_LEN，跟用户态测试程序共用 */
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zhouylll");
 MODULE_DESCRIPTION("Minimal character device driver exercise");
-
-static char kbuf[BUF_SIZE];
-static size_t kbuf_len;
 
 struct hello_dev {
     dev_t            devid;
@@ -58,69 +57,139 @@ struct hello_dev {
     struct device   *device;
 };
 
+struct hello_priv {
+      char         buf[BUF_SIZE];
+      size_t       len;
+      struct mutex lock;   /* 现在锁是每次 open 各自一把，不再是全局共享的 mydev.lock */
+};
+
 static struct hello_dev mydev;
 
 static int hello_open(struct inode *inode, struct file *filp)
 {
 	/* TODO */
-	filp->private_data = &mydev;     /* 关键：把设备结构体传给后续 read/write */
+	struct hello_priv *priv;
+
+	priv = kzalloc(sizeof(struct hello_priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	mutex_init(&priv->lock);
+	filp->private_data = priv;  /* 每次 open 都分配一个私有数据结构，存放缓冲区和长度 */
 	return 0;
 }
 
 static int hello_release(struct inode *inode, struct file *filp)
 {
 	/* TODO */
-	//struct hello_dev *dev = (struct hello_dev*)filp->private_data;
+	struct hello_priv *priv = (struct hello_priv *)filp->private_data;
+	if (priv) {
+		mutex_destroy(&priv->lock);
+		kfree(priv);
+	}
 	return 0;
 }
 
+
 static ssize_t hello_read(struct file *filp, char __user *buf, size_t count, loff_t *ppos)
 {
+	int ret = 0;
 	size_t bytes_to_read;
+	struct hello_priv *priv = filp->private_data;
+
+	if (mutex_lock_interruptible(&priv->lock))
+    return -ERESTARTSYS;   /* 被信号打断，直接返回，内核会决定要不要重启这次系统调用 */
 	
 	/* 计算实际要读的字节数，不能超过缓冲区长度 */
-	if (*ppos >= kbuf_len) {
-		return 0; // 已经读到末尾，返回 EOF
+	if (*ppos >= priv->len) {
+		ret = 0; // 已经读到末尾，返回 EOF
+		goto OUT_UNLOCK;
 	}
 
-	bytes_to_read = min_t(size_t, count, kbuf_len - *ppos);
+	bytes_to_read = min_t(size_t, count, priv->len - *ppos);
 
-	if (copy_to_user(buf, kbuf + *ppos, bytes_to_read)) {
+	if (copy_to_user(buf, priv->buf + *ppos, bytes_to_read)) {
 		printk("kernel read failed!\r\n");
-		return -EFAULT;
+		ret = -EFAULT;
+		goto OUT_UNLOCK;
 	}
 
 	*ppos += bytes_to_read; // 更新文件偏移量
-	if (*ppos > kbuf_len) *ppos = kbuf_len; // 防止越界
+	if (*ppos > priv->len) *ppos = priv->len; // 防止越界
 
-	return bytes_to_read;
+	ret =  bytes_to_read;
+OUT_UNLOCK:
+	mutex_unlock(&priv->lock); // 解锁
+	return ret;
 }
 
 static ssize_t hello_write(struct file *filp, const char __user *buf, size_t count, loff_t *ppos)
 {
-	/* TODO */
+
+	struct hello_priv *priv = filp->private_data;
 	int ret;
 	size_t space_left = BUF_SIZE - *ppos;
 	size_t bytes_to_write = min_t(size_t, count, space_left);
-    ret = copy_from_user(kbuf + *ppos, buf, bytes_to_write);
+
+	if (mutex_lock_interruptible(&priv->lock))
+    return -ERESTARTSYS;   /* 被信号打断，直接返回，内核会决定要不要重启这次系统调用 */
+
+    ret = copy_from_user(priv->buf + *ppos, buf, bytes_to_write);
     if(ret < 0) {
         printk("kernel write failed!\r\n");
-        return -EFAULT;
+        ret = -EFAULT;
+		goto OUT_UNLOCK;
     }
 
-	return bytes_to_write;
+	*ppos += bytes_to_write;
+    if (*ppos > priv->len) priv->len = *ppos;
+    ret = bytes_to_write;
+
+OUT_UNLOCK:
+	mutex_unlock(&priv->lock); // 解锁
+	return ret;
 }
 
+static long hello_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+	struct hello_priv *priv = filp->private_data;
+	int ret = 0;
+	switch(cmd){
+		case HELLO_CLEAR:
+			if (mutex_lock_interruptible(&priv->lock))
+    			return -ERESTARTSYS;   /* 被信号打断，直接返回，内核会决定要不要重启这次系统调用 */
+			priv->len = 0; // 清空缓冲区长度
+			mutex_unlock(&priv->lock); // 解锁
+			printk("Buffer cleared!\n");
+			break;
+		case HELLO_GET_LEN:
+			if (mutex_lock_interruptible(&priv->lock))
+				return -ERESTARTSYS;   /* 被信号打断，直接返回，内核会决定要不要重启这次系统调用 */
+			ret = put_user(priv->len, (int __user *)arg); // 将缓冲区长度传给用户态
+			mutex_unlock(&priv->lock); // 解锁
+			if(ret < 0) {
+				printk("Failed to get buffer length!\n");
+			}
+			break;
+		default:
+			return -EINVAL; // 无效的命令
+
+	}
+	return ret;
+	
+	
+}
 static const struct file_operations hello_fops = {
 	.owner   = THIS_MODULE,
 	.open    = hello_open,
 	.release = hello_release,
 	.read    = hello_read,
 	.write   = hello_write,
+	.unlocked_ioctl = hello_ioctl,  // 如果需要 ioctl 功能，可以在这里添加
 };
 
 static int __init hello_init(void){
-	int ret = 0;
+
+	int ret;
 	mydev.major = 0;
 
 	/*1.申请设备号 */
@@ -158,7 +227,6 @@ fail_devid: return ret;
 
 static void __exit hello_exit(void)
 {
-	/* TODO */
 	device_destroy(mydev.class, mydev.devid);
 	class_destroy(mydev.class);
 	cdev_del(&mydev.cdev);
