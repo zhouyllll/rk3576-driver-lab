@@ -9,3 +9,4 @@ modules.order
 .tmp_versions/
 Module.symvers
 01-chardev/test_ioctl
+02-platform-driver/test_hello
