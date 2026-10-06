@@ -55,6 +55,8 @@
 #include <linux/sched.h>		/* current、task_pid_nr */
 #include <linux/timer.h>		/* timer_list、timer_setup、mod_timer、del_timer_sync */
 #include <linux/jiffies.h>		/* jiffies、msecs_to_jiffies */
+#include <linux/spinlock.h>		/* spinlock_t、spin_lock、spin_lock_irqsave */
+#include <linux/device.h>		/* DEVICE_ATTR_RW、ATTRIBUTE_GROUPS */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zhouylll");
@@ -93,6 +95,15 @@ static unsigned int debounce_ms;
 module_param(debounce_ms, uint, 0444);
 MODULE_PARM_DESC(debounce_ms, "debounce time in ms, 0 = off (only with bh=0)");
 
+/*
+ * 练习 ③ 后半：测量相邻两次中断的间隔，配合 hello_gpio 的 hrtimer 方波测周期精度。
+ * insmod hello_irq.ko measure=1，结果在 /sys/devices/platform/hello-irq/irq_stats。
+ * 打开后上半部不再逐条打印（1kHz 打印会把控制台淹没），只记统计。
+ */
+static bool measure;
+module_param(measure, bool, 0444);
+MODULE_PARM_DESC(measure, "record interval statistics between interrupts (only with bh=0, no debounce)");
+
 /* 每个设备一份 */
 struct hello_irq_dev {
 	struct miscdevice miscdev;
@@ -127,6 +138,19 @@ struct hello_irq_dev {
 	 * 两个执行流（硬中断、定时器软中断）可能在不同 CPU 上同时访问 → atomic_t
 	 */
 	atomic_t raw_edges;
+
+	/*
+	 * ---- 练习 ③ 后半：间隔统计 ----
+	 * 【新写法，阶段 5 预习】spinlock：这几个字段要"一起"更新、"一起"读，
+	 * 否则 sysfs 读到的可能是 n 已经 +1、sum 还没加上的半截状态。atomic_t 只能保护单个整数，管不了一组。
+	 * 写的一方在硬中断里，读的一方（sysfs show）在进程上下文，所以：
+	 *   硬中断里：spin_lock / spin_unlock（中断处理期间本 CPU 的中断本来就是关的）
+	 *   进程上下文：spin_lock_irqsave —— 必须同时关本 CPU 的中断，否则持锁期间中断进来、
+	 *   handler 再去拿同一把锁，就在同一个 CPU 上自己等自己，死锁
+	 */
+	spinlock_t stats_lock;
+	ktime_t prev_edge;		/* 上一次中断的时间，0 = 还没有 */
+	u64 n, min_ns, max_ns, sum_ns;
 };
 
 /*
@@ -228,6 +252,26 @@ static irqreturn_t hello_irq_handler(int irq, void *dev_id)
 	WRITE_ONCE(hdev->t_top, ktime_get());
 	atomic_inc(&hdev->raw_edges);
 
+	if (measure) {
+		ktime_t now = hdev->t_top;
+
+		spin_lock(&hdev->stats_lock);
+		if (hdev->prev_edge) {
+			u64 d = ktime_to_ns(ktime_sub(now, hdev->prev_edge));
+
+			hdev->n++;
+			hdev->sum_ns += d;
+			hdev->min_ns = min(hdev->min_ns, d);
+			hdev->max_ns = max(hdev->max_ns, d);
+		}
+		hdev->prev_edge = now;
+		spin_unlock(&hdev->stats_lock);
+
+		atomic_inc(&hdev->count);
+		wake_up_interruptible(&hdev->wq);
+		return IRQ_HANDLED;
+	}
+
 	if (debounce_ms) {
 		/*
 		 * 每个边沿都把到期时间往后推：抖动期间定时器一直到不了期。
@@ -286,6 +330,56 @@ static void hello_irq_debounce(struct timer_list *t)
 	dev_info(hdev->dev, "debounce: %d raw edge(s) -> 1 event\n", raw);
 	hello_irq_do_bottom(hdev, "timer");
 }
+
+/* ============================ sysfs：irq_stats ============================ */
+
+static void hello_irq_stats_reset(struct hello_irq_dev *hdev)
+{
+	hdev->prev_edge = 0;
+	hdev->n = 0;
+	hdev->sum_ns = 0;
+	hdev->min_ns = U64_MAX;
+	hdev->max_ns = 0;
+}
+
+/* cat irq_stats → "间隔个数 最小 最大 平均"，单位 ns */
+static ssize_t irq_stats_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct hello_irq_dev *hdev = dev_get_drvdata(dev);
+	unsigned long flags;
+	u64 n, mn, mx, sum;
+
+	spin_lock_irqsave(&hdev->stats_lock, flags);	/* 拷一份快照，持锁时间越短越好 */
+	n = hdev->n;
+	mn = hdev->min_ns;
+	mx = hdev->max_ns;
+	sum = hdev->sum_ns;
+	spin_unlock_irqrestore(&hdev->stats_lock, flags);
+
+	if (!n)
+		return sysfs_emit(buf, "n=0\n");
+	return sysfs_emit(buf, "n=%llu min=%lluns max=%lluns avg=%lluns\n", n, mn, mx, div64_u64(sum, n));
+}
+
+/* echo 0 > irq_stats → 清零重新统计 */
+static ssize_t irq_stats_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct hello_irq_dev *hdev = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&hdev->stats_lock, flags);
+	hello_irq_stats_reset(hdev);
+	spin_unlock_irqrestore(&hdev->stats_lock, flags);
+	return count;
+}
+static DEVICE_ATTR_RW(irq_stats);
+
+static struct attribute *hello_irq_attrs[] = {
+	&dev_attr_irq_stats.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(hello_irq);
 
 /* ============================ file_operations ============================ */
 
@@ -424,11 +518,15 @@ static int hello_irq_probe(struct platform_device *pdev)
 	INIT_WORK(&hdev->work, hello_irq_work);
 	timer_setup(&hdev->debounce, hello_irq_debounce, 0);
 	atomic_set(&hdev->raw_edges, 0);
+	spin_lock_init(&hdev->stats_lock);
+	hello_irq_stats_reset(hdev);
 
 	if (bh < HELLO_BH_NONE || bh > HELLO_BH_THREAD)
 		return dev_err_probe(dev, -EINVAL, "invalid bh=%d (0..3)\n", bh);
 	if (debounce_ms && bh != HELLO_BH_NONE)
 		return dev_err_probe(dev, -EINVAL, "debounce_ms only works with bh=0\n");
+	if (measure && (bh != HELLO_BH_NONE || debounce_ms))
+		return dev_err_probe(dev, -EINVAL, "measure only works with bh=0 and no debounce\n");
 
 	/*
 	 * 【新写法】devm_add_action_or_reset：把自己的清理函数登记进 devm 链表。
@@ -506,6 +604,7 @@ static struct platform_driver hello_irq_driver = {
 	.driver	= {
 		.name		= "hello_irq",
 		.of_match_table	= hello_irq_of_match,
+		.dev_groups	= hello_irq_groups,	/* → /sys/devices/platform/hello-irq/irq_stats */
 	},
 };
 module_platform_driver(hello_irq_driver);

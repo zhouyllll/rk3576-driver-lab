@@ -36,7 +36,9 @@
 #include <linux/of.h>			/* of_device_id */
 #include <linux/gpio/consumer.h>	/* gpio_desc、devm_gpiod_get、gpiod_set/get_value_cansleep */
 #include <linux/device.h>		/* DEVICE_ATTR_RW、ATTRIBUTE_GROUPS、dev_err_probe */
-#include <linux/kstrtox.h>		/* kstrtobool */
+#include <linux/kstrtox.h>		/* kstrtobool、kstrtouint */
+#include <linux/hrtimer.h>		/* hrtimer：阶段 4 练习 ③ 用来产生精确方波 */
+#include <linux/ktime.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zhouylll");
@@ -47,6 +49,14 @@ MODULE_DESCRIPTION("GPIO consumer driver exercise");
  */
 struct hello_gpio_dev {
 	struct gpio_desc *led;
+
+	/*
+	 * 阶段 4 练习 ③：hrtimer 每 half_period_us 翻转一次引脚，输出方波。
+	 * 杜邦线把这个引脚接到 hello_irq 的输入脚，就能用中断测 hrtimer 的周期精度。
+	 */
+	struct hrtimer wave_timer;
+	unsigned int half_period_us;	/* 0 = 停止；只在 sysfs store（进程上下文）里写 */
+	int wave_level;			/* 只在 hrtimer 回调里读写 */
 };
 
 /* ============================ sysfs 属性 ============================ */
@@ -91,8 +101,69 @@ static ssize_t value_store(struct device *dev, struct device_attribute *attr,
 /* 可读写：权限 0644，需要 value_show 和 value_store 两个函数 */
 static DEVICE_ATTR_RW(value);
 
+/*
+ * 【新写法】hrtimer 回调：高精度定时器到期时调用。
+ *
+ *   - 运行在硬中断上下文（HRTIMER_MODE_REL 默认是 hard 模式），不能睡眠，
+ *     所以这里只能用不带 _cansleep 的 gpiod_set_value（start 时检查过控制器不会睡）
+ *   - hrtimer_forward_now：把到期时间往后推一个周期。基准是"上一次的到期时间"，
+ *     不是"现在"，所以回调本身的执行耗时不会累积成周期误差
+ *   - 返回 HRTIMER_RESTART 表示继续；HRTIMER_NORESTART 表示到此为止
+ */
+static enum hrtimer_restart hello_gpio_wave(struct hrtimer *t)
+{
+	struct hello_gpio_dev *hdev = container_of(t, struct hello_gpio_dev, wave_timer);
+
+	hdev->wave_level = !hdev->wave_level;
+	gpiod_set_value(hdev->led, hdev->wave_level);
+
+	hrtimer_forward_now(t, ns_to_ktime((u64)READ_ONCE(hdev->half_period_us) * NSEC_PER_USEC));
+	return HRTIMER_RESTART;
+}
+
+static ssize_t half_period_us_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct hello_gpio_dev *hdev = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", hdev->half_period_us);
+}
+
+/*
+ * echo 500 > half_period_us ：每 500us 翻转一次，方波周期 1ms（1kHz，每 1ms 一个上升沿）
+ * echo 0   > half_period_us ：停止，引脚回到低电平
+ */
+static ssize_t half_period_us_store(struct device *dev, struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct hello_gpio_dev *hdev = dev_get_drvdata(dev);
+	unsigned int us;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &us);
+	if (ret)
+		return ret;
+	if (us && us < 50)		/* 太快的话 CPU 全耗在定时器中断上 */
+		return -EINVAL;
+	if (us && gpiod_cansleep(hdev->led))	/* 回调里不能睡，控制器会睡就不支持 */
+		return -EOPNOTSUPP;
+
+	/* 先停：hrtimer_cancel 会等正在执行的回调跑完 */
+	hrtimer_cancel(&hdev->wave_timer);
+	WRITE_ONCE(hdev->half_period_us, us);
+	if (us) {
+		hdev->wave_level = 0;
+		gpiod_set_value_cansleep(hdev->led, 0);
+		hrtimer_start(&hdev->wave_timer, ns_to_ktime((u64)us * NSEC_PER_USEC), HRTIMER_MODE_REL);
+	} else {
+		gpiod_set_value_cansleep(hdev->led, 0);
+	}
+	return count;
+}
+static DEVICE_ATTR_RW(half_period_us);
+
 static struct attribute *hello_gpio_attrs[] = {
 	&dev_attr_value.attr,
+	&dev_attr_half_period_us.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(hello_gpio);
@@ -132,6 +203,15 @@ static int hello_gpio_probe(struct platform_device *pdev)
 	 * 要放在 return 0 之前：driver core 先调 probe，probe 成功后才创建 dev_groups 里的属性文件，
 	 * 所以 value_show/value_store 被调用时 drvdata 一定已经设好了。
 	 */
+	/*
+	 * 【新写法】hrtimer_init(定时器, 时钟源, 模式)
+	 *   CLOCK_MONOTONIC：单调递增的时钟，不受修改系统时间影响
+	 *   HRTIMER_MODE_REL：start 时给的是"从现在起多久"；默认 hard 模式，回调在硬中断里执行
+	 * 6.1 还是 hrtimer_init + 手动设 function；更新的内核改成了 hrtimer_setup 一步完成。
+	 */
+	hrtimer_init(&hdev->wave_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	hdev->wave_timer.function = hello_gpio_wave;
+
 	platform_set_drvdata(pdev, hdev);
 	dev_info(dev, "probed, led gpio = %d\n", desc_to_gpio(hdev->led));
 	return 0;
@@ -143,6 +223,13 @@ static int hello_gpio_probe(struct platform_device *pdev)
  */
 static int hello_gpio_remove(struct platform_device *pdev)
 {
+	struct hello_gpio_dev *hdev = platform_get_drvdata(pdev);
+
+	/*
+	 * 必须停掉 hrtimer：它不是 devm 管理的。不停的话，模块卸载后定时器到期，
+	 * 回调函数的代码已经不在了 → 内核崩溃。
+	 */
+	hrtimer_cancel(&hdev->wave_timer);
 	dev_info(&pdev->dev, "removed\n");
 	return 0;
 }
