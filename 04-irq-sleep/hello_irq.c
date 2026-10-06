@@ -49,7 +49,10 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/atomic.h>
-#include <linux/delay.h>		/* msleep：只用于调试练习 */
+#include <linux/delay.h>		/* msleep */
+#include <linux/workqueue.h>		/* work_struct、INIT_WORK、schedule_work、cancel_work_sync */
+#include <linux/ktime.h>		/* ktime_get、ktime_us_delta */
+#include <linux/sched.h>		/* current、task_pid_nr */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zhouylll");
@@ -62,6 +65,23 @@ MODULE_DESCRIPTION("GPIO interrupt + blocking read + poll exercise");
 static bool bug_sleep_in_irq;
 module_param(bug_sleep_in_irq, bool, 0444);
 MODULE_PARM_DESC(bug_sleep_in_irq, "DEBUG EXERCISE: call msleep() inside the hard IRQ handler");
+
+/*
+ * 练习 ②：下半部选哪种。insmod hello_irq.ko bh=N
+ *   0：不用下半部，全部在硬中断里做（第一版的做法）
+ *   1：tasklet          —— 软中断上下文，不能睡眠
+ *   2：workqueue        —— kworker 内核线程，进程上下文，可以睡眠
+ *   3：线程化中断        —— 专用内核线程 irq/<virq>-hello_irq，进程上下文，可以睡眠
+ */
+enum {
+	HELLO_BH_NONE,
+	HELLO_BH_TASKLET,
+	HELLO_BH_WORK,
+	HELLO_BH_THREAD,
+};
+static int bh = HELLO_BH_NONE;
+module_param(bh, int, 0444);
+MODULE_PARM_DESC(bh, "bottom half: 0=none 1=tasklet 2=workqueue 3=threaded irq");
 
 /* 每个设备一份 */
 struct hello_irq_dev {
@@ -79,6 +99,16 @@ struct hello_irq_dev {
 	 * read 没数据时把当前进程挂到这里睡眠；中断来了 wake_up 把它们叫醒。
 	 */
 	wait_queue_head_t wq;
+
+	/* ---- 练习 ② 下半部用到的 ---- */
+	struct device *dev;			/* 给下半部里的 dev_info 用 */
+	/*
+	 * 上半部记下的时间，下半部用来算"晚了多久"。
+	 * 只有上半部写、下半部读，单个变量 → READ_ONCE/WRITE_ONCE 就够（不需要原子或锁）
+	 */
+	ktime_t t_top;
+	struct tasklet_struct tasklet;		/* bh=1 */
+	struct work_struct work;		/* bh=2 */
 };
 
 /*
@@ -90,30 +120,121 @@ struct hello_irq_priv {
 	int seen;
 };
 
-/* ============================ 中断处理函数 ============================ */
+/* ============================ 中断处理：上半部 + 下半部 ============================ */
 
 /*
- * 【新写法】中断处理函数（硬中断上下文，hard IRQ）。
+ * 真正的"处理"：不管哪种下半部，最后都调到这里。
+ * 打印自己运行在谁身上、什么上下文、比上半部晚了多少，用来对比四种方式。
+ *
+ *   current          ：当前 CPU 上正在运行的线程（task_struct）。在中断/软中断里，它是被"借用"的那个线程
+ *   preempt_count()  ：bit 8-15 软中断计数，bit 16-19 硬中断计数（见 04 笔记）
+ *   in_task()        ：是不是进程上下文（不在硬中断、软中断、NMI 里）——只有这时才能睡眠
+ */
+static void hello_irq_do_bottom(struct hello_irq_dev *hdev, const char *how)
+{
+	s64 delay_us = ktime_us_delta(ktime_get(), READ_ONCE(hdev->t_top));
+
+	dev_info(hdev->dev, "%-8s comm=%-16s pid=%-4d preempt=0x%08x in_task=%d delay=%lldus\n",
+		 how, current->comm, task_pid_nr(current), preempt_count(), !!in_task(), delay_us);
+
+	/*
+	 * 进程上下文里才能睡：workqueue 和线程化中断走这里，合法。
+	 * 硬中断（bh=0）和 tasklet（bh=1）会跳过——在它们里面 msleep 就是上一个调试练习的 BUG。
+	 */
+	if (in_task())
+		/*
+		 * 【新写法】usleep_range(min, max)：基于高精度定时器（hrtimer）的睡眠，适合 10us~20ms。
+		 * 不用 msleep(5)：msleep 按 jiffy 计时，本内核 HZ=250，一个 jiffy 是 4ms，
+		 * msleep(5) 实际会睡 8~12ms（checkpatch 会警告，见 Documentation/timers/timers-howto.rst）。
+		 * 给一个范围而不是一个精确值，是为了让内核把相近的定时器合并唤醒，省电。
+		 */
+		usleep_range(5000, 6000);
+
+	atomic_inc(&hdev->count);
+	wake_up_interruptible(&hdev->wq);
+}
+
+/*
+ * 【新写法】tasklet 回调。
+ * 硬中断里 tasklet_schedule() 只是登记一下；硬中断返回时内核处理软中断，就在那时调用它。
+ * 参数是 tasklet_struct 的地址，from_tasklet 就是 container_of 的包装，找回 hdev。
+ */
+static void hello_irq_tasklet(struct tasklet_struct *t)
+{
+	struct hello_irq_dev *hdev = from_tasklet(hdev, t, tasklet);
+
+	hello_irq_do_bottom(hdev, "tasklet");
+}
+
+/*
+ * 【新写法】workqueue 回调。
+ * schedule_work() 把 work 挂到系统默认的工作队列上，由某个 kworker 内核线程取出来执行。
+ * 参数是 work_struct 的地址，同样 container_of 找回 hdev。
+ */
+static void hello_irq_work(struct work_struct *work)
+{
+	struct hello_irq_dev *hdev = container_of(work, struct hello_irq_dev, work);
+
+	hello_irq_do_bottom(hdev, "work");
+}
+
+/*
+ * 【新写法】线程化中断的"线程函数"：上半部返回 IRQ_WAKE_THREAD 后，
+ * 内核唤醒为这个中断专门创建的线程 irq/<virq>-hello_irq 来执行它。
+ * dev_id 跟上半部一样，是 request 时传的 hdev。
+ */
+static irqreturn_t hello_irq_thread(int irq, void *dev_id)
+{
+	hello_irq_do_bottom(dev_id, "thread");
+	return IRQ_HANDLED;
+}
+
+/*
+ * 上半部（硬中断上下文）。
  *
  * 规则：
  *   - 不能睡眠：不能用 mutex、msleep、kmalloc(GFP_KERNEL)、copy_to_user……
- *     （阶段 4 的调试练习就是故意在这里调 msleep，看 "scheduling while atomic"）
  *   - 要快：中断处理期间，这个 CPU 上的同级中断都在等它
- *   - 返回值：IRQ_HANDLED 表示"是我的中断，处理了"；共享中断线时，不是自己的要返回 IRQ_NONE
+ *   - 返回值：IRQ_HANDLED 表示"是我的中断，处理了"；共享中断线时不是自己的要返回 IRQ_NONE；
+ *     线程化中断返回 IRQ_WAKE_THREAD，表示"请唤醒我的线程"
  *
- * 这里只做两件最快的事：计数 +1，叫醒等待的进程。真正的工作（拷数据给用户）留在 read 里做。
- * dev_id 就是 devm_request_irq 最后一个参数传进来的指针。
+ * 上半部只做最紧急的：记下时间，然后按 bh 参数把剩下的工作交出去。
  */
 static irqreturn_t hello_irq_handler(int irq, void *dev_id)
 {
 	struct hello_irq_dev *hdev = dev_id;
 
 	if (bug_sleep_in_irq)
-		msleep(10);	/* 错误示范：msleep 会让出 CPU 去调度别的进程，硬中断里不允许 */
+		msleep(20);	/* 错误示范：msleep 会让出 CPU 去调度别的进程，硬中断里不允许 */
 
-	atomic_inc(&hdev->count);
-	wake_up_interruptible(&hdev->wq);
-	return IRQ_HANDLED;
+	WRITE_ONCE(hdev->t_top, ktime_get());
+
+	switch (bh) {
+	case HELLO_BH_TASKLET:
+		tasklet_schedule(&hdev->tasklet);
+		return IRQ_HANDLED;
+	case HELLO_BH_WORK:
+		schedule_work(&hdev->work);
+		return IRQ_HANDLED;
+	case HELLO_BH_THREAD:
+		return IRQ_WAKE_THREAD;
+	default:
+		hello_irq_do_bottom(hdev, "hardirq");	/* 全部在硬中断里做 */
+		return IRQ_HANDLED;
+	}
+}
+
+/*
+ * 【新写法】配合 devm_add_action_or_reset 的清理函数：保证下半部不会在 hdev 释放后还运行。
+ *   tasklet_kill    ：等已登记的 tasklet 跑完，并且不再执行
+ *   cancel_work_sync：取消还没执行的 work；正在执行的，等它跑完
+ */
+static void hello_irq_bh_cleanup(void *data)
+{
+	struct hello_irq_dev *hdev = data;
+
+	tasklet_kill(&hdev->tasklet);
+	cancel_work_sync(&hdev->work);
 }
 
 /* ============================ file_operations ============================ */
@@ -248,6 +369,25 @@ static int hello_irq_probe(struct platform_device *pdev)
 	 */
 	atomic_set(&hdev->count, 0);
 	init_waitqueue_head(&hdev->wq);
+	hdev->dev = dev;
+	tasklet_setup(&hdev->tasklet, hello_irq_tasklet);
+	INIT_WORK(&hdev->work, hello_irq_work);
+
+	if (bh < HELLO_BH_NONE || bh > HELLO_BH_THREAD)
+		return dev_err_probe(dev, -EINVAL, "invalid bh=%d (0..3)\n", bh);
+
+	/*
+	 * 【新写法】devm_add_action_or_reset：把自己的清理函数登记进 devm 链表。
+	 * devm 按"登记的相反顺序"释放，这里登记在 request_irq 之前，所以解绑时：
+	 *   先 free_irq（中断不会再来，也就不会再 schedule 下半部）
+	 *   再 hello_irq_bh_cleanup（把已经登记的 tasklet/work 收尾）
+	 *   最后释放 hdev 内存
+	 * 顺序反了的话：work 收尾之后中断又来一次、又 schedule_work，hdev 释放后 work 才跑 → use-after-free。
+	 * _or_reset：登记失败时立刻调用一次清理函数，所以失败直接 return 即可。
+	 */
+	ret = devm_add_action_or_reset(dev, hello_irq_bh_cleanup, hdev);
+	if (ret)
+		return ret;
 
 	/*
 	 * 【新写法】devm_request_irq(dev, 中断号, 处理函数, 标志, 名字, dev_id)
@@ -256,8 +396,18 @@ static int hello_irq_probe(struct platform_device *pdev)
 	 *   dev_id = hdev：原样传给 handler 的第二个参数
 	 *   devm：解绑时自动 free_irq
 	 */
-	ret = devm_request_irq(dev, hdev->irq, hello_irq_handler,
-			       IRQF_TRIGGER_RISING, "hello_irq", hdev);
+	if (bh == HELLO_BH_THREAD)
+		/*
+		 * 【新写法】线程化中断：多一个参数 thread_fn。
+		 * IRQF_ONESHOT：线程函数跑完之前，这根中断线保持屏蔽。
+		 * 电平触发的设备必须加（不屏蔽的话，线程还没来得及清掉硬件的中断源，电平还在，中断会一直重进）；
+		 * 上半部传 NULL 时内核也强制要求加。
+		 */
+		ret = devm_request_threaded_irq(dev, hdev->irq, hello_irq_handler, hello_irq_thread,
+						IRQF_TRIGGER_RISING | IRQF_ONESHOT, "hello_irq", hdev);
+	else
+		ret = devm_request_irq(dev, hdev->irq, hello_irq_handler,
+				       IRQF_TRIGGER_RISING, "hello_irq", hdev);
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to request irq %d\n", hdev->irq);
 
@@ -273,8 +423,8 @@ static int hello_irq_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register misc device\n");
 
-	dev_info(dev, "gpio %d -> irq %d, /dev/%s ready\n",
-		 desc_to_gpio(hdev->gpiod), hdev->irq, hdev->miscdev.name);
+	dev_info(dev, "gpio %d -> irq %d, /dev/%s ready, bh=%d\n",
+		 desc_to_gpio(hdev->gpiod), hdev->irq, hdev->miscdev.name, bh);
 	return 0;
 }
 
