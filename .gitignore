@@ -11,3 +11,4 @@ Module.symvers
 01-chardev/test_ioctl
 02-platform-driver/test_hello
 04-irq-sleep/test_poll
+04-irq-sleep/test_input
