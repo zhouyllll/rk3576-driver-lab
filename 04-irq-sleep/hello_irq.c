@@ -53,6 +53,8 @@
 #include <linux/workqueue.h>		/* work_struct、INIT_WORK、schedule_work、cancel_work_sync */
 #include <linux/ktime.h>		/* ktime_get、ktime_us_delta */
 #include <linux/sched.h>		/* current、task_pid_nr */
+#include <linux/timer.h>		/* timer_list、timer_setup、mod_timer、del_timer_sync */
+#include <linux/jiffies.h>		/* jiffies、msecs_to_jiffies */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zhouylll");
@@ -83,6 +85,14 @@ static int bh = HELLO_BH_NONE;
 module_param(bh, int, 0444);
 MODULE_PARM_DESC(bh, "bottom half: 0=none 1=tasklet 2=workqueue 3=threaded irq");
 
+/*
+ * 练习 ③：消抖。insmod hello_irq.ko debounce_ms=20
+ * 0 表示不消抖。跟 bh 二选一（消抖的"下半部"就是定时器回调）。
+ */
+static unsigned int debounce_ms;
+module_param(debounce_ms, uint, 0444);
+MODULE_PARM_DESC(debounce_ms, "debounce time in ms, 0 = off (only with bh=0)");
+
 /* 每个设备一份 */
 struct hello_irq_dev {
 	struct miscdevice miscdev;
@@ -109,6 +119,14 @@ struct hello_irq_dev {
 	ktime_t t_top;
 	struct tasklet_struct tasklet;		/* bh=1 */
 	struct work_struct work;		/* bh=2 */
+
+	/* ---- 练习 ③ 消抖用到的 ---- */
+	struct timer_list debounce;		/* 最后一个边沿之后 debounce_ms 到期 */
+	/*
+	 * 收到的原始边沿数（包括抖动），只在上半部 ++，定时器回调里读后清零。
+	 * 两个执行流（硬中断、定时器软中断）可能在不同 CPU 上同时访问 → atomic_t
+	 */
+	atomic_t raw_edges;
 };
 
 /*
@@ -208,6 +226,16 @@ static irqreturn_t hello_irq_handler(int irq, void *dev_id)
 		msleep(20);	/* 错误示范：msleep 会让出 CPU 去调度别的进程，硬中断里不允许 */
 
 	WRITE_ONCE(hdev->t_top, ktime_get());
+	atomic_inc(&hdev->raw_edges);
+
+	if (debounce_ms) {
+		/*
+		 * 每个边沿都把到期时间往后推：抖动期间定时器一直到不了期。
+		 * mod_timer 对还没到期的定时器调用，效果就是"重新设定到期时间"。
+		 */
+		mod_timer(&hdev->debounce, jiffies + msecs_to_jiffies(debounce_ms));
+		return IRQ_HANDLED;
+	}
 
 	switch (bh) {
 	case HELLO_BH_TASKLET:
@@ -235,6 +263,28 @@ static void hello_irq_bh_cleanup(void *data)
 
 	tasklet_kill(&hdev->tasklet);
 	cancel_work_sync(&hdev->work);
+	del_timer_sync(&hdev->debounce);	/* 取消定时器；回调正在跑的话等它跑完 */
+}
+
+/*
+ * 【新写法】定时器回调：信号最后一次跳变之后 debounce_ms 都没有新的边沿，才会走到这里。
+ * 运行在软中断上下文（跟 tasklet 一样），不能睡眠。
+ *
+ * 到期后再读一次引脚：抖动结束后稳定在高电平，才算一次有效的"按下"。
+ * 读引脚用不带 _cansleep 的 gpiod_get_value：这里不能睡。gpio-rockchip 是 SoC 内部的控制器，
+ * 访问不会睡眠，所以可以这样用；要是换成 I2C 扩展的 GPIO，就只能把这部分挪到 workqueue 里。
+ */
+static void hello_irq_debounce(struct timer_list *t)
+{
+	struct hello_irq_dev *hdev = from_timer(hdev, t, debounce);
+	int raw = atomic_xchg(&hdev->raw_edges, 0);	/* 取出这一轮收到的边沿数，同时清零，一步完成 */
+
+	if (gpiod_get_value(hdev->gpiod) != 1) {
+		dev_info(hdev->dev, "debounce: %d raw edge(s), level low at expiry -> ignored\n", raw);
+		return;
+	}
+	dev_info(hdev->dev, "debounce: %d raw edge(s) -> 1 event\n", raw);
+	hello_irq_do_bottom(hdev, "timer");
 }
 
 /* ============================ file_operations ============================ */
@@ -372,9 +422,13 @@ static int hello_irq_probe(struct platform_device *pdev)
 	hdev->dev = dev;
 	tasklet_setup(&hdev->tasklet, hello_irq_tasklet);
 	INIT_WORK(&hdev->work, hello_irq_work);
+	timer_setup(&hdev->debounce, hello_irq_debounce, 0);
+	atomic_set(&hdev->raw_edges, 0);
 
 	if (bh < HELLO_BH_NONE || bh > HELLO_BH_THREAD)
 		return dev_err_probe(dev, -EINVAL, "invalid bh=%d (0..3)\n", bh);
+	if (debounce_ms && bh != HELLO_BH_NONE)
+		return dev_err_probe(dev, -EINVAL, "debounce_ms only works with bh=0\n");
 
 	/*
 	 * 【新写法】devm_add_action_or_reset：把自己的清理函数登记进 devm 链表。
@@ -423,8 +477,8 @@ static int hello_irq_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "failed to register misc device\n");
 
-	dev_info(dev, "gpio %d -> irq %d, /dev/%s ready, bh=%d\n",
-		 desc_to_gpio(hdev->gpiod), hdev->irq, hdev->miscdev.name, bh);
+	dev_info(dev, "gpio %d -> irq %d, /dev/%s ready, bh=%d debounce_ms=%u\n",
+		 desc_to_gpio(hdev->gpiod), hdev->irq, hdev->miscdev.name, bh, debounce_ms);
 	return 0;
 }
 
