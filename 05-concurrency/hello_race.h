@@ -44,4 +44,14 @@ struct hello_snapshot {
 #define HELLO_RACE_MAGIC	'r'
 #define HELLO_RACE_WAIT_N	_IOW(HELLO_RACE_MAGIC, 1, __u32)
 
+/*
+ * lockdep 调试练习（完整，不用改）：故意制造 AB-BA 加锁顺序
+ *   HELLO_RACE_LOCK_AB：先拿 lock_a，再拿 lock_b
+ *   HELLO_RACE_LOCK_BA：先拿 lock_b，再拿 lock_a
+ * 依次各调用一次就够了，不需要两个进程同时跑——lockdep 记录"拿锁的顺序"，发现矛盾就报。
+ * _IO：没有参数。
+ */
+#define HELLO_RACE_LOCK_AB	_IO(HELLO_RACE_MAGIC, 2)
+#define HELLO_RACE_LOCK_BA	_IO(HELLO_RACE_MAGIC, 3)
+
 #endif

@@ -42,6 +42,7 @@
 #include <linux/completion.h>	/* 练习 ②：completion、init_completion、complete、wait_for_completion_* */
 #include <linux/atomic.h>	/* 练习 ②：atomic_t、atomic_dec_if_positive、atomic_cmpxchg */
 #include <linux/jiffies.h>	/* 练习 ②：msecs_to_jiffies */
+#include <linux/mutex.h>	/* lockdep 实验 B：mutex_init、mutex_lock、mutex_unlock */
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("zhouylll");
@@ -69,6 +70,15 @@ static unsigned int wait_timeout_ms = 3000;
 module_param(wait_timeout_ms, uint, 0444);
 MODULE_PARM_DESC(wait_timeout_ms, "timeout of HELLO_RACE_WAIT_N in ms (default 3000)");
 
+/*
+ * lockdep 实验 A（已写好参数）：read 里故意用 spin_lock 代替 spin_lock_irqsave。
+ * 只在调试版内核（CONFIG_PROVE_LOCKING=y）上做这个实验：
+ * 正常内核上它只是一个"偶尔死锁"的隐患，很难测出来；调试版内核上 lockdep 第一次就会报。
+ */
+static bool bug_noirq;
+module_param(bug_noirq, bool, 0444);
+MODULE_PARM_DESC(bug_noirq, "DEBUG EXERCISE: take hdev->lock with spin_lock (irqs on) in read");
+
 struct hello_race_dev {
 	struct miscdevice miscdev;
 	struct gpio_desc *gpiod;
@@ -93,6 +103,13 @@ struct hello_race_dev {
 	struct completion done;
 	atomic_t remaining;
 	atomic_t waiter_busy;
+
+	/*
+	 * ---- lockdep 实验 B：两把 mutex（成员已加好）----
+	 * 只在 ioctl（进程上下文）里拿，所以用 mutex 就行。
+	 */
+	struct mutex lock_a;
+	struct mutex lock_b;
 	struct hello_snapshot snap;	/* 被 lock 保护（use_lock=1 时） */
 };
 
@@ -205,6 +222,13 @@ static ssize_t hello_race_read(struct file *filp, char __user *buf, size_t size,
 	if (size < sizeof(struct hello_snapshot))
 		return -EINVAL;
 
+	/*
+	 * TODO lockdep-A：bug_noirq=1 时，故意用 spin_lock(&hdev->lock) 代替 spin_lock_irqsave；
+	 * 解锁也要相应地用 spin_unlock。只在 use_lock=1 时有意义。
+	 * 预期（调试版内核）：第一次 read 时 lockdep 报
+	 *   "inconsistent {IN-HARDIRQ-W} -> {HARDIRQ-ON-W} usage"
+	 * 不需要中断真的在持锁时进来：lockdep 记住了"这把锁在硬中断里拿过"，现在又在中断开着时拿，就报。
+	 */
 	if (use_lock)
 		spin_lock_irqsave(&hdev->lock, flags);
 
@@ -284,6 +308,16 @@ static long hello_race_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 		if (ret == 0)
 			return -ETIMEDOUT;
 		return ret;
+	/*
+	 * TODO lockdep-B：加两个 case
+	 *   HELLO_RACE_LOCK_AB：mutex_lock(&hdev->lock_a); mutex_lock(&hdev->lock_b);
+	 *                       然后按相反顺序解锁（先 b 后 a），返回 0
+	 *   HELLO_RACE_LOCK_BA：先 lock_b 再 lock_a，同样相反顺序解锁，返回 0
+	 * 预期（调试版内核）：先调一次 AB、再调一次 BA，第二次时 lockdep 报
+	 *   "possible circular locking dependency detected"
+	 * 思考：两次调用是先后执行的，并没有真的死锁，lockdep 凭什么判断"可能死锁"？
+	 *       如果两个进程同时一个调 AB、一个调 BA，什么情况下会真的卡死？
+	 */
 	default:
 		/* 内核约定：不认识的 ioctl 命令返回 -ENOTTY */
 		return -ENOTTY;
@@ -343,6 +377,10 @@ static int hello_race_probe(struct platform_device *pdev)
 	 */
 
 	init_completion(&hdev->done);
+	/*
+	 * TODO lockdep-B：mutex_init(&hdev->lock_a)、mutex_init(&hdev->lock_b)
+	 * （mutex 跟 completion 一样，清零不等于初始化）
+	 */
 
 	//atomic_set(0)可以省,devm_kzalloc 已经把内存清零了
 	atomic_set(&hdev->remaining, 0);
