@@ -13,3 +13,4 @@ Module.symvers
 04-irq-sleep/test_poll
 04-irq-sleep/test_input
 05-concurrency/test_race
+05-concurrency/test_wait
