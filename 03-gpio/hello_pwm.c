@@ -129,10 +129,14 @@ static int hello_pwm_probe(struct platform_device *pdev)
 }
 
 /*
- * 卸载时要先把 PWM 关掉：devm 只负责"还回去"（pwm_put），不会帮你停止输出，
- * 不关的话 rmmod 之后引脚还在一直输出方波。
- * 这里有一个顺序问题：devm 资源（LED 注销、pwm_put）在 remove 返回之后才释放，
- * 所以 remove 里 PWM 还拿在手里，可以安全地关掉。
+ * 卸载时把 PWM 关掉。这一步其实是"保险"，不是必须的：
+ *   devm 清理时会先注销 LED（它是在 devm_pwm_get 之后注册的，所以先被清理），
+ *   而 led_classdev_unregister 会自动把亮度设成 LED_OFF（drivers/leds/led-class.c:437 起），
+ *   调到 hello_pwm_set → enabled = false，输出就停了；之后才 pwm_put 归还 PWM。
+ *   如果设了 LED_RETAIN_AT_SHUTDOWN 标志，leds 子系统就不会自动关灯，这时就要靠这里。
+ * 顺序：remove 先执行，devm 资源在 remove 返回之后才释放，所以这里 PWM 还拿在手里，可以安全地关掉。
+ * 也正因为 devm 按"申请的相反顺序"清理，probe 里要先 devm_pwm_get、后注册 LED：
+ * 反过来的话，清理时会先归还 PWM、再注销 LED，注销时调 hello_pwm_set 用的就是已经还回去的 PWM。
  */
 static int hello_pwm_remove(struct platform_device *pdev)
 {
