@@ -12,3 +12,4 @@ Module.symvers
 02-platform-driver/test_hello
 04-irq-sleep/test_poll
 04-irq-sleep/test_input
+05-concurrency/test_race
