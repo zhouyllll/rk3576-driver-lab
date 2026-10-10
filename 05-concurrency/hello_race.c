@@ -229,8 +229,12 @@ static ssize_t hello_race_read(struct file *filp, char __user *buf, size_t size,
 	 *   "inconsistent {IN-HARDIRQ-W} -> {HARDIRQ-ON-W} usage"
 	 * 不需要中断真的在持锁时进来：lockdep 记住了"这把锁在硬中断里拿过"，现在又在中断开着时拿，就报。
 	 */
-	if (use_lock)
-		spin_lock_irqsave(&hdev->lock, flags);
+	if (use_lock) {
+		if (bug_noirq)
+			spin_lock(&hdev->lock);
+		else
+			spin_lock_irqsave(&hdev->lock, flags);
+	}
 
 	local.seq = hdev->snap.seq;
 	ndelay(slow_ns);
@@ -243,8 +247,12 @@ static ssize_t hello_race_read(struct file *filp, char __user *buf, size_t size,
 
 	local.seq_check = hdev->snap.seq_check;
 
-	if (use_lock)
-		spin_unlock_irqrestore(&hdev->lock, flags);
+	if (use_lock) {
+		if (bug_noirq)
+			spin_unlock(&hdev->lock);
+		else
+			spin_unlock_irqrestore(&hdev->lock, flags);
+	}
 
 	if (copy_to_user(buf, &local, sizeof(local)))
 		return -EFAULT;
@@ -318,6 +326,18 @@ static long hello_race_ioctl(struct file *filp, unsigned int cmd, unsigned long 
 	 * 思考：两次调用是先后执行的，并没有真的死锁，lockdep 凭什么判断"可能死锁"？
 	 *       如果两个进程同时一个调 AB、一个调 BA，什么情况下会真的卡死？
 	 */
+	case HELLO_RACE_LOCK_AB:
+		mutex_lock(&hdev->lock_a);
+		mutex_lock(&hdev->lock_b);
+		mutex_unlock(&hdev->lock_b);
+		mutex_unlock(&hdev->lock_a);
+		return 0;
+	case HELLO_RACE_LOCK_BA:
+		mutex_lock(&hdev->lock_b);
+		mutex_lock(&hdev->lock_a);
+		mutex_unlock(&hdev->lock_a);
+		mutex_unlock(&hdev->lock_b);
+		return 0;
 	default:
 		/* 内核约定：不认识的 ioctl 命令返回 -ENOTTY */
 		return -ENOTTY;
@@ -381,7 +401,8 @@ static int hello_race_probe(struct platform_device *pdev)
 	 * TODO lockdep-B：mutex_init(&hdev->lock_a)、mutex_init(&hdev->lock_b)
 	 * （mutex 跟 completion 一样，清零不等于初始化）
 	 */
-
+	mutex_init(&hdev->lock_a);
+	mutex_init(&hdev->lock_b);
 	//atomic_set(0)可以省,devm_kzalloc 已经把内存清零了
 	atomic_set(&hdev->remaining, 0);
 	atomic_set(&hdev->waiter_busy, 0);
