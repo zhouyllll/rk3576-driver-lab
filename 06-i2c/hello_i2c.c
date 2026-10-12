@@ -95,14 +95,41 @@ struct hello_i2c_dev {
  *       别的驱动可能趁机插进来访问总线；有的芯片也要求必须是 RESTART）
  */
 /* __maybe_unused：骨架阶段还没人调用它，写完 TODO 2（probe 里调用了它）后删掉 */
-static int __maybe_unused hello_i2c_read_reg(struct i2c_client *client, u16 reg, u8 *val)
+static int hello_i2c_read_reg(struct i2c_client *client, u16 reg, u8 *val)
 {
-	return -EIO;
+	u8 addr_buf[2];
+	int ret;
+	struct i2c_msg msgs[2];
+
+
+	put_unaligned_be16(reg, addr_buf);
+	if (wrong_addr) {
+		msgs[0].addr  = wrong_addr;
+		msgs[1].addr  = wrong_addr;
+	} else {
+		msgs[0].addr  = client->addr;
+		msgs[1].addr  = client->addr;
+	}
+	msgs[0].flags = 0;
+	msgs[0].len   = 2;
+	msgs[0].buf   = addr_buf;
+
+	msgs[1].flags = I2C_M_RD;
+	msgs[1].len   = 1;
+	msgs[1].buf   = val;
+
+	ret = i2c_transfer(client->adapter, msgs, 2);
+	if (ret != 2) {
+		if (ret < 0)
+			return ret;
+		return -EIO;
+	}
+	return 0;
 }
 
 /* ============================ sysfs：chip_id ============================ */
 
-/*
+/*ret = hello_i2c_read_reg(IMX415_REG_CHIP_ID);
  * TODO 3：cat /sys/bus/i2c/devices/8-0037/chip_id 时，【重新】读一次芯片 ID 寄存器，打印 "0xe0"
  *
  * 1. 从 dev 找回 hello_i2c_dev（probe 里用 i2c_set_clientdata 存的；
@@ -114,7 +141,15 @@ static int __maybe_unused hello_i2c_read_reg(struct i2c_client *client, u16 reg,
  */
 static ssize_t chip_id_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return -EIO;
+	struct hello_i2c_dev *hdev = dev_get_drvdata(dev);
+	int ret;
+	u8 id;
+
+	ret = hello_i2c_read_reg(hdev->client, IMX415_REG_CHIP_ID, &id);
+	if (!ret)
+		return sysfs_emit(buf, "0x%02x\n", id);
+
+	return 0;
 }
 static DEVICE_ATTR_RO(chip_id);
 
@@ -143,7 +178,28 @@ ATTRIBUTE_GROUPS(hello_i2c);
  */
 static int hello_i2c_probe(struct i2c_client *client)
 {
-	return -ENODEV;
+	struct hello_i2c_dev *hdev;
+	int ret;
+	u8 id;
+
+	hdev = devm_kzalloc(&client->dev, sizeof(*hdev), GFP_KERNEL);
+	if (!hdev)
+		return -ENOMEM;
+
+	hdev->client = client;
+	i2c_set_clientdata(client, hdev);
+	ret = hello_i2c_read_reg(client, IMX415_REG_CHIP_ID, &id);
+	if (ret)
+		return dev_err_probe(&client->dev, ret, "failed to read chip id\n");
+	if (id != IMX415_CHIP_ID) {
+		dev_err(&client->dev, "unexpected chip id 0x%02x\n", id);
+		return -ENODEV;
+	}
+
+	hdev->chip_id = id;
+	dev_info(&client->dev, "i2c-%d addr 0x%02x chip id 0x%02x\n", client->adapter->nr, client->addr, hdev->chip_id);
+
+	return 0;
 }
 
 /*
