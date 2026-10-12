@@ -95,11 +95,20 @@ struct hello_uart_dev {
 /* 骨架里的 __maybe_unused：还没人调用时防止 -Werror 报"未使用"，全部写完后删掉 */
 static u32 __maybe_unused hello_uart_read(struct hello_uart_dev *hdev, int reg)
 {
-	return 0;
+	int offset;
+	u32 value;
+
+	offset = reg<<HELLO_UART_REG_SHIFT;
+	value = readl(hdev->base + offset);
+
+	return value;
 }
 
-static void __maybe_unused hello_uart_write(struct hello_uart_dev *hdev, int reg, u32 val)
+static void hello_uart_write(struct hello_uart_dev *hdev, int reg, u32 val)
 {
+	int offset = reg << HELLO_UART_REG_SHIFT;
+
+	writel(val, hdev->base + offset);
 }
 
 /* ============================ 硬件初始化 ============================ */
@@ -121,8 +130,37 @@ static void __maybe_unused hello_uart_write(struct hello_uart_dev *hdev, int reg
  *
  * 注意第 2 步的顺序：DLAB 置 1 以后，写 0 号寄存器是在写 DLL，不是发数据。忘了关 DLAB，后面"发送"的字节全写进了分频寄存器。
  */
-static void __maybe_unused hello_uart_hw_init(struct hello_uart_dev *hdev)
+static int hello_uart_hw_init(struct hello_uart_dev *hdev)
 {
+	u32 divisor;
+	unsigned long rate;
+	int ret;
+
+	ret = clk_set_rate(hdev->baudclk, 16 * baud);
+	if (ret)
+		return 0;
+	rate = clk_get_rate(hdev->baudclk);
+
+	hello_uart_write(hdev, UART_IER, 0);
+
+	divisor = DIV_ROUND_CLOSEST(rate, 16 * baud);
+	if (divisor == 0) {
+		pr_err("baudclk %lu Hz too slow for baud %u\n", rate, baud);
+		return -EINVAL;
+	}
+
+	hello_uart_write(hdev, UART_LCR, UART_LCR_DLAB);              // 打开 DLAB
+	hello_uart_write(hdev, UART_DLL, divisor & 0xff);
+	hello_uart_write(hdev, UART_DLM, divisor >> 8);              // 高 8 位
+	hello_uart_write(hdev, UART_LCR, UART_LCR_WLEN8);              // 关掉 DLAB，设成 8N1
+
+	hello_uart_write(hdev, UART_FCR, UART_FCR_ENABLE_FIFO | UART_FCR_CLEAR_RCVR | UART_FCR_CLEAR_XMIT);              // 开 FIFO + 清空收发
+	hello_uart_write(hdev, UART_MCR, UART_MCR_LOOP);              // 内部回环
+
+	pr_info("baudclk %lu Hz, divisor %u\n", rate, divisor);
+
+	return 0;
+
 }
 
 /*
@@ -141,7 +179,26 @@ static void __maybe_unused hello_uart_hw_init(struct hello_uart_dev *hdev)
  */
 static int __maybe_unused hello_uart_tx_byte(struct hello_uart_dev *hdev, u8 c)
 {
-	return -ETIMEDOUT;
+	u32 value;
+	int i;
+
+	for (i = 0; i < 1000; i++) {
+		value = hello_uart_read(hdev, UART_LSR);
+		if (value & UART_LSR_THRE)
+			break;
+		udelay(10);
+	}
+	if (i >= 1000) {
+		return -ETIMEDOUT;
+	}
+	/*
+	*ret = readl_poll_timeout_atomic(hdev->base + (UART_LSR << HELLO_UART_REG_SHIFT),value,(value & UART_LSR_THRE),10,10000);
+	*if(ret)
+	*	return ret;
+	*/
+
+	hello_uart_write(hdev, UART_TX, c);
+	return 0;
 }
 
 /* ============================ 文件操作 ============================ */
@@ -150,7 +207,7 @@ static int __maybe_unused hello_uart_tx_byte(struct hello_uart_dev *hdev, u8 c)
  * file->private_data 怎么来的：misc 框架在 open 时把 private_data 设成 &hdev->misc，
  * 所以这里用 container_of 从 misc 找回 hdev（阶段 5 讲过的写法）。
  */
-static struct hello_uart_dev __maybe_unused *to_hdev(struct file *file)
+static struct hello_uart_dev *to_hdev(struct file *file)
 {
 	return container_of(file->private_data, struct hello_uart_dev, misc);
 }
@@ -172,7 +229,26 @@ static struct hello_uart_dev __maybe_unused *to_hdev(struct file *file)
 static ssize_t hello_uart_write_fop(struct file *file, const char __user *ubuf,
 				    size_t count, loff_t *ppos)
 {
-	return -EINVAL;	/* 占位，写完记得改 */
+	struct hello_uart_dev *hdev = to_hdev(file);
+	size_t n = min_t(size_t, count, HELLO_UART_FIFO_SIZE);
+	u8 kbuf[HELLO_UART_FIFO_SIZE];
+	int ret, i;
+
+	if (copy_from_user(kbuf, ubuf, n))
+		return -EFAULT;
+
+	mutex_lock(&hdev->lock);
+	for (i = 0; i < n; i++) {
+		ret = hello_uart_tx_byte(hdev, kbuf[i]);
+		if (ret < 0)
+			break;
+	}
+	mutex_unlock(&hdev->lock);
+
+	if (i == 0)
+		return ret;
+
+	return i;
 }
 
 /*
@@ -190,7 +266,22 @@ static ssize_t hello_uart_write_fop(struct file *file, const char __user *ubuf,
 static ssize_t hello_uart_read_fop(struct file *file, char __user *ubuf,
 				   size_t count, loff_t *ppos)
 {
-	return -EINVAL;	/* 占位，写完记得改 */
+	struct hello_uart_dev *hdev = to_hdev(file);
+	int i, lsr;
+	size_t to_read = (count < HELLO_UART_FIFO_SIZE) ? count : HELLO_UART_FIFO_SIZE;
+	u8 kbuf[HELLO_UART_FIFO_SIZE];
+
+	mutex_lock(&hdev->lock);
+	for (i = 0; i < to_read; i++) {
+		lsr = hello_uart_read(hdev, UART_LSR);
+		if (!(lsr & UART_LSR_DR))
+			break;
+		kbuf[i] = hello_uart_read(hdev, UART_RX);
+	}
+	mutex_unlock(&hdev->lock);
+	if (copy_to_user(ubuf, kbuf, i))
+	return -EFAULT;
+	return i;                        // 读到了几个字节
 }
 
 static const struct file_operations hello_uart_fops = {
@@ -223,7 +314,50 @@ static const struct file_operations hello_uart_fops = {
  */
 static int hello_uart_probe(struct platform_device *pdev)
 {
-	return -ENODEV;
+	struct hello_uart_dev *hdev;
+	int ret;
+
+	hdev = devm_kzalloc(&pdev->dev, sizeof(*hdev), GFP_KERNEL);
+	if (!hdev)
+		return -ENOMEM;
+	mutex_init(&hdev->lock);
+	hdev->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(hdev->base))
+		return PTR_ERR(hdev->base);
+
+	if (!skip_clk) {
+		hdev->pclk = devm_clk_get_enabled(&pdev->dev, "apb_pclk");
+		if (IS_ERR(hdev->pclk))
+			return dev_err_probe(&pdev->dev, PTR_ERR(hdev->pclk), "failed to get apb_pclk\n");
+
+		hdev->baudclk = devm_clk_get_enabled(&pdev->dev, "baudclk");
+		if (IS_ERR(hdev->baudclk))
+			return dev_err_probe(&pdev->dev, PTR_ERR(hdev->baudclk), "failed to get baudclk\n");
+	}
+
+	dev_info(&pdev->dev, "LSR before init: 0x%02x\n", hello_uart_read(hdev, UART_LSR));
+	hello_uart_write(hdev, UART_SCR, 0x5a);
+	dev_info(&pdev->dev, "SCR : 0x%02x\n", hello_uart_read(hdev, UART_SCR));
+	hello_uart_write(hdev, UART_SCR, 0xa5);
+	dev_info(&pdev->dev, "SCR : 0x%02x\n", hello_uart_read(hdev, UART_SCR));
+
+	ret = hello_uart_hw_init(hdev);
+	if (ret)
+		return ret;
+
+	hdev->misc.minor = MISC_DYNAMIC_MINOR;
+	hdev->misc.name  = "hello_uart";
+	hdev->misc.fops  = &hello_uart_fops;
+	hdev->misc.parent = &pdev->dev;
+
+	platform_set_drvdata(pdev, hdev);
+	ret = misc_register(&hdev->misc);
+	if (ret)
+		return ret;
+
+	 dev_info(&pdev->dev, "registered /dev/%s, regs mapped at %px\n", hdev->misc.name, hdev->base);
+
+	return 0;
 }
 
 /*
@@ -237,6 +371,7 @@ static int hello_uart_remove(struct platform_device *pdev)
 	struct hello_uart_dev *hdev = platform_get_drvdata(pdev);
 
 	misc_deregister(&hdev->misc);
+
 	return 0;
 }
 
