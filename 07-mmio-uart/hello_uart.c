@@ -280,7 +280,7 @@ static ssize_t hello_uart_read_fop(struct file *file, char __user *ubuf,
 	}
 	mutex_unlock(&hdev->lock);
 	if (copy_to_user(ubuf, kbuf, i))
-	return -EFAULT;
+		return -EFAULT;
 	return i;                        // 读到了几个字节
 }
 
