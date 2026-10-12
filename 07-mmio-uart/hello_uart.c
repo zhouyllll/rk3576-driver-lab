@@ -138,7 +138,7 @@ static int hello_uart_hw_init(struct hello_uart_dev *hdev)
 
 	ret = clk_set_rate(hdev->baudclk, 16 * baud);
 	if (ret)
-		return 0;
+		return ret;
 	rate = clk_get_rate(hdev->baudclk);
 
 	hello_uart_write(hdev, UART_IER, 0);
