@@ -87,13 +87,17 @@ static size_t __maybe_unused hbuf_size;	/* 字节数 = PAGE_SIZE << order */
 static ssize_t hello_mmap_read(struct file *file, char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
-	return -EINVAL;	/* 占位，写完记得改 */
+
+	return simple_read_from_buffer(ubuf, count, ppos, (void *)hbuf, hbuf_size);
+
 }
 
 static ssize_t hello_mmap_write(struct file *file, const char __user *ubuf,
 				size_t count, loff_t *ppos)
 {
-	return -EINVAL;	/* 占位，写完记得改 */
+
+	return simple_write_to_buffer((void *)hbuf, hbuf_size, ppos, ubuf, count);
+
 }
 
 /* ============================ mmap ============================ */
@@ -131,7 +135,25 @@ static ssize_t hello_mmap_write(struct file *file, const char __user *ubuf,
  */
 static int hello_mmap_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	return -EINVAL;	/* 占位，写完记得改 */
+	size_t size = vma->vm_end - vma->vm_start;
+	unsigned long pfn;
+	int ret;
+
+	if (!no_size_check) {
+		if (((vma->vm_pgoff << PAGE_SHIFT) + size) > hbuf_size)
+			return -EINVAL;
+	}
+
+	pfn = (virt_to_phys((void *)hbuf) >> PAGE_SHIFT) + vma->vm_pgoff;
+
+	ret = remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
+	if (ret)
+		return ret;
+
+	pr_info("mmap user 0x%lx size %zu -> phys 0x%llx\n",
+	vma->vm_start, size, (u64)pfn << PAGE_SHIFT);
+
+	return 0;
 }
 
 static const struct file_operations hello_mmap_fops = {
@@ -170,7 +192,27 @@ static struct miscdevice __maybe_unused hello_mmap_misc = {
  */
 static int __init hello_mmap_init(void)
 {
-	return -ENODEV;	/* 占位，写完记得改 */
+	int ret;
+
+	hbuf_order = get_order(buf_pages*PAGE_SIZE);
+	hbuf_size = PAGE_SIZE << hbuf_order;
+
+	hbuf = __get_free_pages(GFP_KERNEL | __GFP_ZERO, hbuf_order);
+	if (!hbuf)
+		return -ENOMEM;
+
+	snprintf((char *)hbuf, hbuf_size, "hello from kernel\n");
+
+	ret = misc_register(&hello_mmap_misc);
+	if (ret) {
+		free_pages(hbuf, hbuf_order);
+		return ret;
+	}
+
+	pr_info("mmap demo: %d pages, order %d, size %zu bytes\n", buf_pages, hbuf_order, hbuf_size);
+	pr_info("hbuf virt=%px phys=%llx\n", (void *)hbuf, (unsigned long long)virt_to_phys((void *)hbuf));
+
+	return 0;	/* 占位，写完记得改 */
 }
 
 /*
@@ -182,6 +224,9 @@ static int __init hello_mmap_init(void)
  */
 static void __exit hello_mmap_exit(void)
 {
+	misc_deregister(&hello_mmap_misc);
+	free_pages(hbuf, hbuf_order);
+
 }
 
 module_init(hello_mmap_init);
