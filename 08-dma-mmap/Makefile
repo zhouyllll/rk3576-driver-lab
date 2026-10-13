@@ -6,7 +6,7 @@
 #
 # 产出 hello_mmap.ko，记得 cp 到 ~/rk3576-nfs-share/ 再去板子上用。
 
-obj-m += hello_mmap.o
+obj-m += hello_mmap.o hello_uart_dma.o
 
 KDIR := /home/dministrator/rk3576-kernel
 PWD := $(shell pwd)

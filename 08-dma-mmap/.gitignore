@@ -1,2 +1,3 @@
 hello_mmap.ko
 test_mmap
+hello_uart_dma.ko
