@@ -146,6 +146,8 @@ static ssize_t chip_id_show(struct device *dev, struct device_attribute *attr, c
 	u8 id;
 
 	ret = hello_i2c_read_reg(hdev->client, IMX415_REG_CHIP_ID, &id);
+	if (ret)
+		return ret;
 	if (!ret)
 		return sysfs_emit(buf, "0x%02x\n", id);
 
