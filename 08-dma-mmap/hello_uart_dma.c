@@ -166,7 +166,6 @@ static ssize_t hello_uart_tx_pio(struct hello_uart_dev *hdev, const u8 *buf, siz
 
 /* ============================ DMA 发送 ============================ */
 
-/* 骨架里的 __maybe_unused：还没人调用时防止 -Werror 报"未使用"，全部写完后删掉 */
 
 /*
  * TODO 2：DMA 完成回调。
@@ -179,8 +178,11 @@ static ssize_t hello_uart_tx_pio(struct hello_uart_dev *hdev, const u8 *buf, siz
  *
  * 思考：这里能不能调用 mutex_lock、msleep？（提示：tasklet 是什么上下文？）
  */
-static void __maybe_unused hello_uart_dma_tx_done(void *param)
+static void hello_uart_dma_tx_done(void *param)
 {
+	struct hello_uart_dev *hdev = param;
+
+	complete(&hdev->tx_done);
 }
 
 /*
@@ -207,9 +209,35 @@ static void __maybe_unused hello_uart_dma_tx_done(void *param)
  * 为什么 2 里传 dma_buf_addr 而不是 dma_buf：dma_buf 是 CPU 的虚拟地址，要经过 CPU 的 MMU 才有意义；
  * PL330 不经过 CPU 的 MMU，它要的是自己能直接用的地址（这块板子上就是物理地址）。
  */
-static ssize_t __maybe_unused hello_uart_tx_dma(struct hello_uart_dev *hdev, size_t n)
+static ssize_t hello_uart_tx_dma(struct hello_uart_dev *hdev, size_t n)
 {
-	return -EINVAL;	/* 占位，写完记得改 */
+	struct dma_async_tx_descriptor *desc;
+	dma_cookie_t cookie;
+	unsigned long timeout;
+
+	reinit_completion(&hdev->tx_done);
+
+	desc = dmaengine_prep_slave_single(hdev->txchan, hdev->dma_buf_addr, n,
+		DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
+	if (!desc)
+		return -EIO;
+
+	desc->callback = hello_uart_dma_tx_done;
+	desc->callback_param = hdev;
+
+	cookie = dmaengine_submit(desc);
+	if (dma_submit_error(cookie))
+		return -EIO;
+
+	hello_uart_write(hdev, DW_UART_DMASA, 1);
+	dma_async_issue_pending(hdev->txchan);
+	timeout = wait_for_completion_timeout(&hdev->tx_done, msecs_to_jiffies(1000));
+	if (timeout == 0) {
+		dmaengine_terminate_sync(hdev->txchan);
+		return -ETIMEDOUT;
+	}
+
+	return n;
 }
 
 /* ============================ 文件操作 ============================ */
@@ -251,8 +279,16 @@ static ssize_t hello_uart_write_fop(struct file *file, const char __user *ubuf,
 		mutex_unlock(&hdev->lock);
 		return ret;
 	}
+	n = min_t(size_t, count, HELLO_UART_DMA_BUF_SIZE);
+	mutex_lock(&hdev->lock);
+	if (copy_from_user(hdev->dma_buf, ubuf, n)) {
+		mutex_unlock(&hdev->lock);
+		return -EFAULT;
+	}
+	ret = hello_uart_tx_dma(hdev, n);
+	mutex_unlock(&hdev->lock);
 
-	return -EINVAL;	/* 占位，写完记得改 */
+	return ret;
 }
 
 /* read：你在阶段 7 写的，没改。回环里 DMA 发出去的字节一样会进接收 FIFO */
@@ -290,7 +326,7 @@ static const struct file_operations hello_uart_fops = {
  * 释放 DMA 资源。由 devm_add_action_or_reset 注册（TODO 1 第 5 步），remove 后自动调用。
  * 顺序跟申请相反：先还缓冲区，再还通道。（已写好）
  */
-static void __maybe_unused hello_uart_dma_release(void *data)
+static void hello_uart_dma_release(void *data)
 {
 	struct hello_uart_dev *hdev = data;
 
@@ -343,9 +379,40 @@ static void __maybe_unused hello_uart_dma_release(void *data)
  *      （提示：CPU 写进 dma_buf 的数据，可能还停在 CPU 的 cache 里，没写到内存——PL330 从内存读，会读到什么？
  *       "coherent" 就是为了解决这个问题。）
  */
-static int __maybe_unused hello_uart_dma_init(struct hello_uart_dev *hdev, struct device *dev)
+static int hello_uart_dma_init(struct hello_uart_dev *hdev, struct device *dev)
 {
-	return -ENODEV;	/* 占位，写完记得改 */
+	struct dma_slave_config cfg = {};
+	int ret;
+
+	hdev->txchan = dma_request_chan(dev, "tx");
+	if (IS_ERR(hdev->txchan))
+		return dev_err_probe(dev, PTR_ERR(hdev->txchan), "no tx dma channel\n");
+
+	cfg.direction      = DMA_MEM_TO_DEV;
+	cfg.dst_addr       = hdev->phys_base + (UART_TX << HELLO_UART_REG_SHIFT);
+	cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
+	cfg.dst_maxburst   = dma_burst;
+
+	ret = dmaengine_slave_config(hdev->txchan, &cfg);
+	if (ret) {
+		dma_release_channel(hdev->txchan);
+		return ret;
+	}
+
+	hdev->dma_buf = dma_alloc_coherent(hdev->txchan->device->dev, HELLO_UART_DMA_BUF_SIZE,
+		&hdev->dma_buf_addr, GFP_KERNEL);
+	if (!hdev->dma_buf) {
+		dma_release_channel(hdev->txchan);
+		return -ENOMEM;
+	}
+
+	init_completion(&hdev->tx_done);
+	dev_info(dev, "dma_buf=%px, dma_buf_addr=%pad, dma_burst=%u, pl330 dev=%s\n",
+			hdev->dma_buf, &hdev->dma_buf_addr, dma_burst,
+			dev_name(hdev->txchan->device->dev));
+
+	return devm_add_action_or_reset(dev, hello_uart_dma_release, hdev);
+
 }
 
 /* ============================ probe / remove ============================ */
@@ -385,6 +452,11 @@ static int hello_uart_probe(struct platform_device *pdev)
 	 * TODO 5：use_dma 为真时调用 hello_uart_dma_init(hdev, &pdev->dev)，失败返回 ret。
 	 * 放在 misc_register 之前：/dev 节点一出现用户就可能 write，DMA 必须已经准备好。
 	 */
+	if (use_dma) {
+		ret = hello_uart_dma_init(hdev, &pdev->dev);
+		if (ret)
+			return ret;
+	}
 
 	hdev->misc.minor = MISC_DYNAMIC_MINOR;
 	hdev->misc.name = "hello_uart_dma";
