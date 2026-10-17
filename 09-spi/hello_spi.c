@@ -31,6 +31,7 @@
  * =============================================================================================
  */
 
+
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/module.h>
@@ -99,7 +100,36 @@ struct hello_spi_dev {
  */
 static ssize_t loopback_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	return -EINVAL;	/* 占位，写完记得改 */
+	struct hello_spi_dev *hdev = dev_get_drvdata(dev);
+	struct spi_transfer t = {};
+	int ret, i;
+	size_t len;
+	bool ok;
+
+	mutex_lock(&hdev->lock);
+	for (i = 0; i < xfer_len; i++)
+		hdev->tx[i] = hdev->seq + i;
+
+	hdev->seq++;
+	memset(hdev->rx, 0, xfer_len);
+
+	t.tx_buf = hdev->tx;
+	t.rx_buf = hdev->rx;
+	t.len    = xfer_len;
+
+	ret = spi_sync_transfer(hdev->spi, &t, 1);
+	if (ret) {
+		mutex_unlock(&hdev->lock);
+		return ret;
+	}
+	ok = !memcmp(hdev->tx, hdev->rx, xfer_len);
+	len = sysfs_emit(buf, "tx: %*ph\n", (int)min_t(uint, xfer_len, 16), hdev->tx);
+	len += sysfs_emit_at(buf, len, "rx: %*ph\n", (int)min_t(uint, xfer_len, 16), hdev->rx);
+	len += sysfs_emit_at(buf, len, "%s (%u bytes @ %u Hz)\n", ok ? "OK" : "MISMATCH", xfer_len, speed_hz);
+
+	mutex_unlock(&hdev->lock);
+
+	return len;
 }
 static DEVICE_ATTR_RO(loopback);
 
@@ -132,7 +162,43 @@ ATTRIBUTE_GROUPS(hello_spi);
  */
 static int hello_spi_probe(struct spi_device *spi)
 {
-	return -ENODEV;	/* 占位，写完记得改 */
+	struct hello_spi_dev *hdev;
+	int ret;
+
+	hdev = devm_kzalloc(&spi->dev, sizeof(*hdev), GFP_KERNEL);
+	if (!hdev)
+		return -ENOMEM;
+
+	hdev->spi = spi;
+	mutex_init(&hdev->lock);
+	spi_set_drvdata(spi, hdev);
+
+	if (xfer_len == 0 || xfer_len > HELLO_SPI_MAX_LEN)
+		return -EINVAL;
+
+	hdev->tx = devm_kzalloc(&spi->dev, xfer_len, GFP_KERNEL);
+	if (!hdev->tx)
+		return -ENOMEM;
+
+	hdev->rx = devm_kzalloc(&spi->dev, xfer_len, GFP_KERNEL);
+	if (!hdev->rx)
+		return -ENOMEM;
+
+	hdev->spi->mode = SPI_MODE_0;
+	hdev->spi->bits_per_word = 8;
+	hdev->spi->max_speed_hz = speed_hz;
+
+	ret = spi_setup(hdev->spi);
+	if (ret)
+		return dev_err_probe(&spi->dev, ret, "spi_setup failed\n");
+
+	/* 5. 打印总线信息 */
+	dev_info(&spi->dev,
+	"HelloSPI: bus=%d cs=%u mode=0x%x speed=%u xfer_len=%u\n",
+	spi->controller->bus_num, spi_get_chipselect(spi, 0),
+	spi->mode, spi->max_speed_hz, xfer_len);
+
+	return 0;
 }
 
 /* 6.1 里 spi_driver 的 remove 返回 void；内存都是 devm 的，sysfs 由 dev_groups 自动删 */
