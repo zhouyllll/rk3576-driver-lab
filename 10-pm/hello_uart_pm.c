@@ -91,8 +91,7 @@ static void hello_uart_write(struct hello_uart_dev *hdev, int reg, u32 val)
 	writel(val, hdev->base + (reg << HELLO_UART_REG_SHIFT));
 }
 
-/* 骨架里的 __maybe_unused：还没人调用时防止 -Werror 报"未使用"，写完 TODO 后删掉 */
-static int __maybe_unused hello_uart_hw_init(struct hello_uart_dev *hdev)
+static int hello_uart_hw_init(struct hello_uart_dev *hdev)
 {
 	unsigned long rate;
 	u32 divisor;
@@ -160,13 +159,26 @@ static int hello_uart_tx_byte(struct hello_uart_dev *hdev, u8 c)
  * 思考：clk_prepare_enable 是 clk_prepare + clk_enable 两步。为什么框架要拆成两步？
  *      （提示：clk_prepare 可以睡眠（比如要等 PLL 锁定），clk_enable 不能睡眠、可以在中断里调用）
  */
-static int __maybe_unused hello_uart_clk_on(struct hello_uart_dev *hdev)
+static int hello_uart_clk_on(struct hello_uart_dev *hdev)
 {
-	return -ENODEV;	/* 占位，写完记得改 */
+	int ret;
+
+	ret = clk_prepare_enable(hdev->pclk);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(hdev->baudclk);
+	if (ret) {
+		clk_disable_unprepare(hdev->pclk);
+		return ret;
+	}
+
+	return 0;
 }
 
-static void __maybe_unused hello_uart_clk_off(struct hello_uart_dev *hdev)
+static void hello_uart_clk_off(struct hello_uart_dev *hdev)
 {
+	clk_disable_unprepare(hdev->baudclk);
+	clk_disable_unprepare(hdev->pclk);
 }
 
 /* ============================ runtime PM 回调 ============================ */
@@ -191,13 +203,34 @@ static void __maybe_unused hello_uart_clk_off(struct hello_uart_dev *hdev)
  *   ③ 关时钟时寄存器的值会丢吗？（回想阶段 7 案例 16：rmmod 只关时钟，卡在发送端的 'h' 下次还在）
  *      什么情况下 resume 必须重新初始化？（提示：如果 suspend 时关的不只是时钟，而是整个电源域呢？）
  */
-static int __maybe_unused hello_uart_runtime_suspend(struct device *dev)
+static int hello_uart_runtime_suspend(struct device *dev)
 {
+	struct hello_uart_dev *hdev = dev_get_drvdata(dev);
+
+	hello_uart_clk_off(hdev);
+	dev_info(dev, "runtime suspend\n");
+
 	return 0;
 }
 
-static int __maybe_unused hello_uart_runtime_resume(struct device *dev)
+static int hello_uart_runtime_resume(struct device *dev)
 {
+	struct hello_uart_dev *hdev = dev_get_drvdata(dev);
+	int ret;
+
+	ret = hello_uart_clk_on(hdev);
+	if (ret)
+		return ret;
+	if (reinit_on_resume) {
+		ret = hello_uart_hw_init(hdev);
+		if (ret) {
+			hello_uart_clk_off(hdev);
+			return ret;
+		}
+
+	}
+
+	dev_info(dev, "runtime resume\n");
 	return 0;
 }
 
@@ -235,7 +268,9 @@ static ssize_t hello_uart_write_fop(struct file *file, const char __user *ubuf,
 	if (copy_from_user(kbuf, ubuf, n))
 		return -EFAULT;
 
-	/* TODO 3：get */
+	ret = pm_runtime_resume_and_get(hdev->dev);
+	if (ret < 0)
+		return ret;
 
 	mutex_lock(&hdev->lock);
 	for (i = 0; i < n; i++) {
@@ -245,7 +280,8 @@ static ssize_t hello_uart_write_fop(struct file *file, const char __user *ubuf,
 	}
 	mutex_unlock(&hdev->lock);
 
-	/* TODO 3：mark_last_busy + put */
+	pm_runtime_mark_last_busy(hdev->dev);
+	pm_runtime_put_autosuspend(hdev->dev);
 
 	return i ? i : ret;
 }
@@ -257,8 +293,11 @@ static ssize_t hello_uart_read_fop(struct file *file, char __user *ubuf,
 	size_t to_read = min_t(size_t, count, HELLO_UART_FIFO_SIZE);
 	u8 kbuf[HELLO_UART_FIFO_SIZE];
 	size_t i;
+	int ret;
 
-	/* TODO 3：get */
+	ret = pm_runtime_resume_and_get(hdev->dev);
+	if (ret < 0)
+		return ret;
 
 	mutex_lock(&hdev->lock);
 	for (i = 0; i < to_read; i++) {
@@ -268,7 +307,8 @@ static ssize_t hello_uart_read_fop(struct file *file, char __user *ubuf,
 	}
 	mutex_unlock(&hdev->lock);
 
-	/* TODO 3：mark_last_busy + put */
+	pm_runtime_mark_last_busy(hdev->dev);
+	pm_runtime_put_autosuspend(hdev->dev);
 
 	if (copy_to_user(ubuf, kbuf, i))
 		return -EFAULT;
@@ -288,7 +328,7 @@ static int hello_uart_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct hello_uart_dev *hdev;
-	int __maybe_unused ret;
+	int ret;
 
 	hdev = devm_kzalloc(dev, sizeof(*hdev), GFP_KERNEL);
 	if (!hdev)
@@ -325,12 +365,49 @@ static int hello_uart_probe(struct platform_device *pdev)
 	 *           pm_runtime_dont_use_autosuspend）、clk_off，返回 ret
 	 * 5. pm_runtime_mark_last_busy(dev); pm_runtime_put_autosuspend(dev);
 	 *      还掉第 3 步占的计数 → 计数归零 → autosuspend_ms 后自动 suspend（关时钟）
-	 * 6. dev_info 打印 "registered /dev/hello_uart_pm, autosuspend %u ms"
+	 * 6. dev_info 打印 "registered /dev/hello_uart_pm, autosuspend %u ms\n"
 	 *
 	 * 第 3 步的顺序就是 imx415 驱动 probe 末尾的写法（drivers/media/i2c/imx415.c:3098-3100），可以对照着看。
 	 */
+	ret = hello_uart_clk_on(hdev);
+	if (ret) {
+		return ret;
+	}
 
-	return -ENODEV;	/* 占位，写完记得改 */
+	ret = hello_uart_hw_init(hdev);
+	if (ret) {
+		hello_uart_clk_off(hdev);
+		return ret;
+	}
+
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_active(dev);
+	pm_runtime_set_autosuspend_delay(dev, autosuspend_ms);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
+
+	hdev->misc.name = "hello_uart_pm";
+	hdev->misc.minor = MISC_DYNAMIC_MINOR;
+	hdev->misc.fops  = &hello_uart_fops;
+	hdev->misc.parent = &pdev->dev;
+
+	ret = misc_register(&hdev->misc);
+
+	if (ret) {
+		pm_runtime_disable(dev);
+		pm_runtime_set_suspended(dev);
+		pm_runtime_put_noidle(dev);
+		pm_runtime_dont_use_autosuspend(dev);
+		hello_uart_clk_off(hdev);
+
+		return ret;
+	}
+	pm_runtime_mark_last_busy(dev);
+	pm_runtime_put_autosuspend(dev);
+
+	dev_info(dev, "registered /dev/hello_uart_pm, autosuspend %u ms\n",
+		 autosuspend_ms);
+	return 0;
 }
 
 /*
@@ -345,6 +422,15 @@ static int hello_uart_probe(struct platform_device *pdev)
  */
 static int hello_uart_remove(struct platform_device *pdev)
 {
+	struct hello_uart_dev *hdev = platform_get_drvdata(pdev);
+	struct device *dev = &pdev->dev;
+
+	misc_deregister(&hdev->misc);
+	pm_runtime_disable(dev);
+	if (!pm_runtime_status_suspended(dev))
+		hello_uart_clk_off(hdev);
+	pm_runtime_set_suspended(dev);
+	pm_runtime_dont_use_autosuspend(dev);
 	return 0;
 }
 
